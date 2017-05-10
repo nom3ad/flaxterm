@@ -21,16 +21,16 @@ def index():
 #     #return send_from_directory('static', path)
 import gevent,random
 from ptyprocess import PtyProcessUnicode
-from gfd import GeventFD
 
+from gevent.os import nb_read,nb_write,make_nonblocking
 @sockets.route('/echo')
 def echo_socket(ws):
     send_json_message(ws,["setup", {}])
     #send_json_message(ws,['stdout', "abcd@demo $ "])
     term = (PtyProcessUnicode.spawn(['/bin/bash']))
     print "started terminal", term.pid
-    gterm = GeventFD(term.fd)
-    gevent.spawn(geen,ws,gterm)
+    print("non blocked",make_nonblocking(term.fd))
+    gevent.spawn(geen,ws,term)
     try:
         while not ws.closed:
             message = ws.receive()
@@ -42,7 +42,7 @@ def echo_socket(ws):
                 continue
             if msg_type == "stdin":
                 #send_json_message(ws,['stdout', command[1]])
-                gterm.write(command[1])
+                nb_write(term.fd,command[1])
                 print "written"
             elif msg_type == "set_size":
                 ws.send("SIZE SET")
@@ -52,15 +52,19 @@ def echo_socket(ws):
 
 
 from  geventwebsocket.exceptions import WebSocketError
-def geen(ws,gterm):
+def geen(ws,term):
     try:
         # for i in range(10000):
         #     send_json_message(ws,['stdout','a'])
         #     gevent.sleep(1)
         print "hey"
         while True:
-             x = gterm.read(1)
-             print x
+             x = nb_read(term.fd,1024)
+             # Read up to n bytes from file descriptor fd. 
+             # Return a string containing the bytes read. 
+             # If end-of-file is reached, an empty string is returned.
+             # The descriptor must be in non-blocking mode.
+             print 'read : ',x
              if not x:
                  break
              send_json_message(ws,['stdout',x])
