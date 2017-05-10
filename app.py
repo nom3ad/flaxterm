@@ -1,109 +1,87 @@
 #!/usr/bin/env python
-from flask import Flask, render_template, session, request
-from flask_socketio import SocketIO, emit, join_room, leave_room, \
-    close_room, rooms, disconnect
+from flask import Flask, render_template, session, request,send_from_directory
+from flask_sockets import Sockets
+import json
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
 # the best option based on installed packages.
-async_mode = None
-
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode=async_mode)
-thread = None
+sockets = Sockets(app)
+app.debug = True
 
-
-def background_thread():
-    """Example of how to send server generated events to clients."""
-    count = 0
-    while True:
-        socketio.sleep(10)
-        count += 1
-        socketio.emit('my_response',
-                      {'data': 'Server generated event', 'count': count},
-                      namespace='/test')
-
-
-@app.route('/')
+print "start"
+@app.route('/t')
 def index():
-    return render_template('index.html', async_mode=socketio.async_mode)
+    return render_template('flaxterm.html')
 
-@socketio.on('my_event', namespace='/test')
-def test_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']})
+# @app.route('/static/<path:path>')
+# def staticserve(path):
+#     return path
+#     #return send_from_directory('static', path)
+import gevent,random
+from ptyprocess import PtyProcessUnicode
+from gfd import GeventFD
 
-
-@socketio.on('my_broadcast_event', namespace='/test')
-def test_broadcast_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']},
-         broadcast=True)
-
-
-@socketio.on('join', namespace='/test')
-def join(message):
-    join_room(message['room'])
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'In rooms: ' + ', '.join(rooms()),
-          'count': session['receive_count']})
-
-
-@socketio.on('leave', namespace='/test')
-def leave(message):
-    leave_room(message['room'])
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'In rooms: ' + ', '.join(rooms()),
-          'count': session['receive_count']})
-
-
-@socketio.on('close_room', namespace='/test')
-def close(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response', {'data': 'Room ' + message['room'] + ' is closing.',
-                         'count': session['receive_count']},
-         room=message['room'])
-    close_room(message['room'])
+@sockets.route('/echo')
+def echo_socket(ws):
+    send_json_message(ws,["setup", {}])
+    #send_json_message(ws,['stdout', "abcd@demo $ "])
+    term = (PtyProcessUnicode.spawn(['/bin/bash']))
+    print "started terminal", term.pid
+    gterm = GeventFD(term.fd)
+    gevent.spawn(geen,ws,gterm)
+    try:
+        while not ws.closed:
+            message = ws.receive()
+            try:
+                command = json.loads(message)
+                msg_type = command[0]  
+            except:
+                # incorrect message
+                continue
+            if msg_type == "stdin":
+                #send_json_message(ws,['stdout', command[1]])
+                gterm.write(command[1])
+                print "written"
+            elif msg_type == "set_size":
+                ws.send("SIZE SET")
+    except Exception as oops:
+        print "Exits downlink:  for %s : %s" % (repr(ws) ,repr(oops))
+        pass
 
 
-@socketio.on('my_room_event', namespace='/test')
-def send_room_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']},
-         room=message['room'])
+from  geventwebsocket.exceptions import WebSocketError
+def geen(ws,gterm):
+    try:
+        # for i in range(10000):
+        #     send_json_message(ws,['stdout','a'])
+        #     gevent.sleep(1)
+        print "hey"
+        while True:
+             x = gterm.read(1)
+             print x
+             if not x:
+                 break
+             send_json_message(ws,['stdout',x])
+        print "end while"
+    except WebSocketError as oops:
+        print "Exits uplink:  for %s : %s" % (repr(ws) ,repr(oops))
+        return
+    print "Exits uplink: shouldnt be g=here"
+
+def send_json_message(ws, content):
+        json_msg = json.dumps(content)
+        ws.send(json_msg)
 
 
-@socketio.on('disconnect_request', namespace='/test')
-def disconnect_request():
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'Disconnected!', 'count': session['receive_count']})
-    disconnect()
+
+import sys
+if __name__ == "__main__":
+    from gevent import pywsgi
+    from geventwebsocket.handler import WebSocketHandler
+    server = pywsgi.WSGIServer(('', 8000), app, handler_class=WebSocketHandler,log=sys.stdout)
+    server.serve_forever()
 
 
-@socketio.on('my_ping', namespace='/test')
-def ping_pong():
-    emit('my_pong')
 
-
-@socketio.on('connect', namespace='/test')
-def test_connect():
-    global thread
-    if thread is None:
-        thread = socketio.start_background_task(target=background_thread)
-    emit('my_response', {'data': 'Connected', 'count': 0})
-
-
-@socketio.on('disconnect', namespace='/test')
-def test_disconnect():
-    print('Client disconnected', request.sid)
-
-
-if __name__ == '__main__':
-    socketio.run(app, debug=True)
