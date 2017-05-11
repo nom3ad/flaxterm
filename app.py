@@ -11,7 +11,7 @@ sockets = Sockets(app)
 app.debug = True
 
 print "start"
-@app.route('/t')
+@app.route('/')
 def index():
     return render_template('flaxterm.html')
 
@@ -23,9 +23,17 @@ import gevent,random
 from ptyprocess import PtyProcessUnicode
 
 from gevent.os import nb_read,nb_write,make_nonblocking
-@sockets.route('/echo')
-def echo_socket(ws):
+
+@sockets.route('/echo/<name>')
+def echo_socket(ws,name=None):
+    #print ws,repr(ws),dir(ws)
+    for i in ws.environ:
+        try:
+            print i,ws.environ[i]
+        except:
+            pass
     send_json_message(ws,["setup", {}])
+    
     #send_json_message(ws,['stdout', "abcd@demo $ "])
     term = (PtyProcessUnicode.spawn(['/bin/bash']))
     print "started terminal", term.pid
@@ -43,16 +51,18 @@ def echo_socket(ws):
             if msg_type == "stdin":
                 #send_json_message(ws,['stdout', command[1]])
                 nb_write(term.fd,command[1])
-                print "written"
+                print "written from %s:%s" % (request.remote_addr,request.environ.get('REMOTE_PORT'))
             elif msg_type == "set_size":
                 ws.send("SIZE SET")
     except Exception as oops:
         print "Exits downlink:  for %s : %s" % (repr(ws) ,repr(oops))
         pass
+    print "Exits downlink gracefully for %s" % repr(ws)
 
 
 from  geventwebsocket.exceptions import WebSocketError
 def geen(ws,term):
+
     try:
         # for i in range(10000):
         #     send_json_message(ws,['stdout','a'])
@@ -65,16 +75,18 @@ def geen(ws,term):
              # If end-of-file is reached, an empty string is returned.
              # The descriptor must be in non-blocking mode.
              print 'read : ',x
+             #print "sends to %s:%s" % (request.remote_addr,request.environ.get('REMOTE_PORT'))
              if not x:
                  break
              send_json_message(ws,['stdout',x])
         print "end while"
-    except WebSocketError as oops:
+    except (WebSocketError,Exception) as oops:
         print "Exits uplink:  for %s : %s" % (repr(ws) ,repr(oops))
         return
-    print "Exits uplink: shouldnt be g=here"
+    print "Exits uplink: shouldnt be here"
 
 def send_json_message(ws, content):
+        #print "sends from %s:%s" % (request.remote_addr,request.environ.get('REMOTE_PORT'))
         json_msg = json.dumps(content)
         ws.send(json_msg)
 

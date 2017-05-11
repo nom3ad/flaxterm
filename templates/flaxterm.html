@@ -31,7 +31,7 @@ var termRowHeight = 0.0 + 1.00*document.getElementById("dummy-screen").offsetHei
 var termColWidth = 0.0 + (1.02*document.getElementById("dummy-screen-rows").offsetWidth / 80);
 document.getElementById("dummy-screen").setAttribute("style", "display: none");
 var protocol = (window.location.protocol.indexOf("https") === 0) ? "wss" : "ws";
-var ws_url = protocol+"://"+ window.location.host+ "/echo";
+var ws_url = protocol+"://"+ window.location.host+ "/websocket/{{termname}}";
 function calculate_size(element) {
 var rows = Math.max(2, Math.floor(element.innerHeight/termRowHeight)-1);
 var cols = Math.max(3, Math.floor(element.innerWidth/termColWidth)-1);

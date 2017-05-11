@@ -16,14 +16,47 @@ import os
 import signal
 
 from ptyprocess import PtyProcessUnicode
-from tornado import gen
-from tornado.ioloop import IOLoop
+
+import gevent
+from gevent.os import nb_read,nb_write,make_nonblocking
 
 ENV_PREFIX = "PYXTERM_"         # Environment variable prefix
 
 DEFAULT_TERM_TYPE = "xterm"
 
+from gevent.socket import wait_read
+from gevent.hub import get_hub
+
+class FdWatcher(object):
+    watchers = {}
+    @classmethod
+    def add_fd(cls, fd, cb):
+        cls.watchers[fd] = gevent.spawn(FdWatcher.geen,fd,cb)
+        print ("watching fd",fd,"by",cls.watchers[fd])
+    @classmethod
+    
+    def remove_fd(cls,fd):
+        pass
+
+    @staticmethod
+    def geen(fd,cb):
+        import random
+        id = random.randint(100,200)    
+        while True:
+            print (" [G:%s] agin wait" % id)
+            wait_read(fd)
+            print ("[G:%s]something to be read"%id)
+            try:
+                cb(fd)
+            except Exception as oops:
+                print("[G:%s]something happend in cb" %id ,repr(oops))
+                if isinstance(oops,EOFError):
+                    print("Exits fd watch for fd =",fd)
+                    return
+
 class PtyWithClients(object):
+    """Consists single pty object and assosiated web socket clients
+    """
     def __init__(self, ptyproc):
         self.ptyproc = ptyproc
         self.clients = []
@@ -57,53 +90,55 @@ class PtyWithClients(object):
     def kill(self, sig=signal.SIGTERM):
         self.ptyproc.kill(sig)
     
-    @gen.coroutine
+    #@gen.coroutine
     def terminate(self, force=False):
         '''This forces a child process to terminate. It starts nicely with
         SIGHUP and SIGINT. If "force" is True then moves onto SIGKILL. This
         returns True if the child was terminated. This returns False if the
         child could not be terminated. '''
         
-        loop = IOLoop.current()
-        sleep = lambda : gen.Task(loop.add_timeout, loop.time() + self.ptyproc.delayafterterminate)
+        #sleep = lambda : gevent.sleep(self.ptyproc.delayafterterminate)
+        def sleep():
+            print('sleeps %ss',self.ptyproc.delayafterterminate)
+            gevent.sleep(self.ptyproc.delayafterterminate)
 
         if not self.ptyproc.isalive():
-            raise gen.Return(True)
+            return(True)
         try:
             self.kill(signal.SIGHUP)
-            yield sleep()
+            sleep()
             if not self.ptyproc.isalive():
-                raise gen.Return(True)
+                return(True)
             self.kill(signal.SIGCONT)
-            yield sleep()
+            sleep()
             if not self.ptyproc.isalive():
-                raise gen.Return(True)
+                return(True)
             self.kill(signal.SIGINT)
-            yield sleep()
+            sleep()
             if not self.ptyproc.isalive():
-                raise gen.Return(True)
+                return(True)
             self.kill(signal.SIGTERM)
-            yield sleep()
+            sleep()
             if not self.ptyproc.isalive():
-                raise gen.Return(True)
+                rreturn(True)
             if force:
                 self.kill(signal.SIGKILL)
-                yield sleep()
+                sleep()
                 if not self.ptyproc.isalive():
-                    raise gen.Return(True)
+                    return(True)
                 else:
-                    raise gen.Return(False)
-            raise gen.Return(False)
+                    return(False)
+            return(False)
         except OSError:
             # I think there are kernel timing issues that sometimes cause
             # this to happen. I think isalive() reports True, but the
             # process is dead to the kernel.
             # Make one last attempt to see if the kernel is up to date.
-            yield sleep()
+            sleep()
             if not self.ptyproc.isalive():
-                raise gen.Return(True)
+                return(True)
             else:
-                raise gen.Return(False)
+                return(False)
 
 def _update_removing(target, changes):
     """Like dict.update(), but remove keys where the value is None.
@@ -117,7 +152,7 @@ def _update_removing(target, changes):
 class TermManagerBase(object):
     """Base class for a terminal manager."""
     def __init__(self, shell_command, server_url="", term_settings={},
-                 extra_env=None, ioloop=None):
+                 extra_env=None):
         self.shell_command = shell_command
         self.server_url = server_url
         self.term_settings = term_settings
@@ -126,13 +161,7 @@ class TermManagerBase(object):
 
         self.ptys_by_fd = {}
 
-        if ioloop is not None:
-            self.ioloop = ioloop
-        else:
-            import tornado.ioloop
-            self.ioloop = tornado.ioloop.IOLoop.instance()
-        
-    def make_term_env(self, height=25, width=80, winheight=0, winwidth=0, **kwargs):
+    def _make_term_env(self, height=25, width=80, winheight=0, winwidth=0, **kwargs):
         """Build the environment variables for the process in the terminal."""
         env = os.environ.copy()
         env["TERM"] = self.term_settings.get("type",DEFAULT_TERM_TYPE)
@@ -151,46 +180,51 @@ class TermManagerBase(object):
 
         return env
 
-    def new_terminal(self, **kwargs):
+    def _new_terminal(self, **kwargs):
         """Make a new terminal, return a :class:`PtyWithClients` instance."""
         options = self.term_settings.copy()
         options['shell_command'] = self.shell_command
-        options.update(kwargs)
+        options.update(kwargs) 
         argv = options['shell_command']
-        env = self.make_term_env(**options)
+        env = self._make_term_env(**options)
         pty = PtyProcessUnicode.spawn(argv, env=env, cwd=options.get('cwd', None))
+        
+        self.log.info(" TTY spawned. fd=%s, cmd=%s" %(pty.fd,argv))
+
         return PtyWithClients(pty)
 
-    def start_reading(self, ptywclients):
+    def _start_reading(self, ptywclients):
         """Connect a terminal to the tornado event loop to read data from it."""
         fd = ptywclients.ptyproc.fd
         self.ptys_by_fd[fd] = ptywclients
-        self.ioloop.add_handler(fd, self.pty_read, self.ioloop.READ)
+        FdWatcher.add_fd(fd, self._pty_read)
 
-    def on_eof(self, ptywclients):
+    def _on_eof(self, ptywclients):
         """Called when the pty has closed.
         """
         # Stop trying to read from that terminal
         fd = ptywclients.ptyproc.fd
-        self.log.info("EOF on FD %d; stopping reading", fd)
+        self.log.info(" ******** EOF on FD %d; stopping reading", fd)
         del self.ptys_by_fd[fd]
-        self.ioloop.remove_handler(fd)
+        FdWatcher.remove_fd(fd)
 
         # This closes the fd, and should result in the process being reaped.
         ptywclients.ptyproc.close()
 
-    def pty_read(self, fd, events=None):
+    def _pty_read(self, fd):
         """Called by the event loop when there is pty data ready to read."""
         ptywclients = self.ptys_by_fd[fd]
         try:
             s = ptywclients.ptyproc.read(65536)
+            print("read %s bytes" % len(s))
             ptywclients.read_buffer.append(s)
             for client in ptywclients.clients:
                 client.on_pty_read(s)
         except EOFError:
-            self.on_eof(ptywclients)
+            self._on_eof(ptywclients)
             for client in ptywclients.clients:
                 client.on_pty_died()
+            raise
 
     def get_terminal(self, url_component=None):
         """Override in a subclass to give a terminal to a new websocket connection
@@ -206,18 +240,18 @@ class TermManagerBase(object):
         """
         pass
 
-    @gen.coroutine
-    def shutdown(self):
-        yield self.kill_all()
+    # @gen.coroutine
+    # def shutdown(self):
+    #     yield self.kill_all()
 
-    @gen.coroutine
-    def kill_all(self):
-        futures = []
-        for term in self.ptys_by_fd.values():
-            futures.append(term.terminate(force=True))
-        # wait for futures to finish
-        for f in futures:
-            yield f
+    # @gen.coroutine
+    # def kill_all(self):
+    #     futures = []
+    #     for term in self.ptys_by_fd.values():
+    #         futures.append(term.terminate(force=True))
+    #     # wait for futures to finish
+    #     for f in futures:
+    #         yield f
 
 
 class SingleTermManager(TermManagerBase):
@@ -226,16 +260,84 @@ class SingleTermManager(TermManagerBase):
         super(SingleTermManager, self).__init__(**kwargs)
         self.terminal = None
 
-    def get_terminal(self, url_component=None):
+    def get_terminal(self, term_name=None):
         if self.terminal is None:
-            self.terminal = self.new_terminal()
-            self.start_reading(self.terminal)
+            #ie, first websocket connection
+            self.terminal = self._new_terminal()
+            self._start_reading(self.terminal)
         return self.terminal
     
-    @gen.coroutine
-    def kill_all(self):
-        yield super(SingleTermManager, self).kill_all()
-        self.terminal = None
+    # @gen.coroutine
+    # def kill_all(self):
+    #     yield super(SingleTermManager, self).kill_all()
+    #     self.terminal = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class MaxTerminalsReached(Exception):
     def __init__(self, max_terminals):
@@ -250,12 +352,12 @@ class UniqueTermManager(TermManagerBase):
         super(UniqueTermManager, self).__init__(**kwargs)
         self.max_terminals = max_terminals
 
-    def get_terminal(self, url_component=None):
+    def get_terminal(self, term_name=None):
         if self.max_terminals and len(self.ptys_by_fd) >= self.max_terminals:
             raise MaxTerminalsReached(self.max_terminals)
 
-        term = self.new_terminal()
-        self.start_reading(term)
+        term = self._new_terminal()
+        self._start_reading(term)
         return term
 
     def client_disconnected(self, websocket):
@@ -284,10 +386,10 @@ class NamedTermManager(TermManagerBase):
 
         # Create new terminal
         self.log.info("New terminal with specified name: %s", term_name)
-        term = self.new_terminal()
+        term = self._new_terminal()
         term.term_name = term_name
         self.terminals[term_name] = term
-        self.start_reading(term)
+        self._start_reading(term)
         return term
 
     name_template = "%d"
@@ -300,29 +402,29 @@ class NamedTermManager(TermManagerBase):
 
     def new_named_terminal(self):
         name = self._next_available_name()
-        term = self.new_terminal()
+        term = self._new_terminal()
         self.log.info("New terminal with automatic name: %s", name)
         term.term_name = name
         self.terminals[name] = term
-        self.start_reading(term)
+        self._start_reading(term)
         return name, term
 
     def kill(self, name, sig=signal.SIGTERM):
         term = self.terminals[name]
         term.kill()   # This should lead to an EOF
     
-    @gen.coroutine
-    def terminate(self, name, force=False):
-        term = self.terminals[name]
-        yield term.terminate(force=force)
+    # @gen.coroutine
+    # def terminate(self, name, force=False):
+    #     term = self.terminals[name]
+    #     yield term.terminate(force=force)
     
     def on_eof(self, ptywclients):
-        super(NamedTermManager, self).on_eof(ptywclients)
+        super(NamedTermManager, self)._on_eof(ptywclients)
         name = ptywclients.term_name
         self.log.info("Terminal %s closed", name)
         self.terminals.pop(name, None)
     
-    @gen.coroutine
-    def kill_all(self):
-        yield super(NamedTermManager, self).kill_all()
-        self.terminals = {}
+    # @gen.coroutine
+    # def kill_all(self):
+    #     yield super(NamedTermManager, self).kill_all()
+    #     self.terminals = {}
