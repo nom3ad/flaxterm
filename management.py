@@ -2,13 +2,6 @@
 """
 from __future__ import absolute_import, print_function
 
-import sys
-if sys.version_info[0] < 3:
-    byte_code = ord
-else:
-    byte_code = lambda x: x
-    unicode = str
-
 from collections import deque
 import itertools
 import logging
@@ -19,8 +12,6 @@ from ptyprocess import PtyProcessUnicode
 
 import gevent
 from gevent.os import nb_read,nb_write,make_nonblocking
-
-ENV_PREFIX = "PYXTERM_"         # Environment variable prefix
 
 DEFAULT_TERM_TYPE = "xterm"
 
@@ -54,20 +45,29 @@ class FdWatcher(object):
                     print("Exits fd watch for fd =",fd)
                     return
 
-class PtyWithClients(object):
-    """Consists single pty object and assosiated web socket clients
+class Terminal(object):
+    """Consists single pty object and tracks all assosiated web socket clients
     """
-    def __init__(self, ptyproc):
+    def __init__(self, argv, cwd=None, env=None,
+                                name='tty', dimensions=(24, 80)):
+        ptyproc = PtyProcessUnicode.spawn(argv, env=env,cwd=cwd)
         self.ptyproc = ptyproc
+        self.name = name
+
+        # tracker for XtermSocketHandler connected to this terminal
         self.clients = []
+
         # Store the last few things read, so when a new client connects,
         # it can show e.g. the most recent prompt, rather than absolutely
         # nothing.
-        self.read_buffer = deque([], maxlen=10)
-
+        self.read_buffer = deque([], maxlen=15)
+    
+    def __repr__(self):
+        return ("<Terminal(name=%s, fd=%s, clients=[%r])>" % 
+                    (self.name, self.ptyproc.fd, self.clients))
+                    
     def resize_to_smallest(self):
         """Set the terminal size to that of the smallest client dimensions.
-        
         A terminal not using the full space available is much nicer than a
         terminal trying to use more than the available space, so we keep it 
         sized to the smallest client.
@@ -151,15 +151,17 @@ def _update_removing(target, changes):
 
 class TermManagerBase(object):
     """Base class for a terminal manager."""
-    def __init__(self, shell_command, server_url="", term_settings={},
-                 extra_env=None):
+    def __init__(self, shell_command, term_settings={}, extra_env=None):
+        """
+        term_settings : dict of settings : eg type, cwd etc
+        """
         self.shell_command = shell_command
-        self.server_url = server_url
         self.term_settings = term_settings
         self.extra_env = extra_env
+
         self.log = logging.getLogger(__name__)
 
-        self.ptys_by_fd = {}
+        self.terminals_by_fd = {}
 
     def _make_term_env(self, height=25, width=80, winheight=0, winwidth=0, **kwargs):
         """Build the environment variables for the process in the terminal."""
@@ -168,12 +170,9 @@ class TermManagerBase(object):
         dimensions = "%dx%d" % (width, height)
         if winwidth and winheight:
             dimensions += ";%dx%d" % (winwidth, winheight)
-        env[ENV_PREFIX+"DIMENSIONS"] = dimensions
+        env["DIMENSIONS"] = dimensions
         env["COLUMNS"] = str(width)
         env["LINES"] = str(height)
-
-        if self.server_url:
-            env[ENV_PREFIX+"URL"] = self.server_url
 
         if self.extra_env:
             _update_removing(env, self.extra_env)
@@ -181,22 +180,20 @@ class TermManagerBase(object):
         return env
 
     def _new_terminal(self, **kwargs):
-        """Make a new terminal, return a :class:`PtyWithClients` instance."""
+        """Make a new terminal, return a :class:`Terminal` instance."""
         options = self.term_settings.copy()
         options['shell_command'] = self.shell_command
         options.update(kwargs) 
         argv = options['shell_command']
         env = self._make_term_env(**options)
-        pty = PtyProcessUnicode.spawn(argv, env=env, cwd=options.get('cwd', None))
-        
-        self.log.info(" TTY spawned. fd=%s, cmd=%s" %(pty.fd,argv))
+        terminal = Terminal(argv, env=env, cwd=options.get('cwd', None))
+        self.log.info('New Termainal started %r' % terminal)
+        return terminal
 
-        return PtyWithClients(pty)
-
-    def _start_reading(self, ptywclients):
+    def _start_reading(self, terminal):
         """Connect a terminal to the tornado event loop to read data from it."""
-        fd = ptywclients.ptyproc.fd
-        self.ptys_by_fd[fd] = ptywclients
+        fd = terminal.ptyproc.fd
+        self.terminals_by_fd[fd] = terminal
         FdWatcher.add_fd(fd, self._pty_read)
 
     def _on_eof(self, ptywclients):
@@ -205,7 +202,7 @@ class TermManagerBase(object):
         # Stop trying to read from that terminal
         fd = ptywclients.ptyproc.fd
         self.log.info(" ******** EOF on FD %d; stopping reading", fd)
-        del self.ptys_by_fd[fd]
+        del self.terminals_by_fd[fd]
         FdWatcher.remove_fd(fd)
 
         # This closes the fd, and should result in the process being reaped.
@@ -213,7 +210,7 @@ class TermManagerBase(object):
 
     def _pty_read(self, fd):
         """Called by the event loop when there is pty data ready to read."""
-        ptywclients = self.ptys_by_fd[fd]
+        ptywclients = self.terminals_by_fd[fd]
         try:
             s = ptywclients.ptyproc.read(65536)
             print("read %s bytes" % len(s))
@@ -226,9 +223,8 @@ class TermManagerBase(object):
                 client.on_pty_died()
             raise
 
-    def get_terminal(self, url_component=None):
+    def get_terminal(self, *args, **kwargs):
         """Override in a subclass to give a terminal to a new websocket connection
-        
         The :class:`TermSocket` handler works with zero or one URL components
         (capturing groups in the URL spec regex). If it receives one, it is
         passed as the ``url_component`` parameter; otherwise, this is None.
@@ -353,7 +349,7 @@ class UniqueTermManager(TermManagerBase):
         self.max_terminals = max_terminals
 
     def get_terminal(self, term_name=None):
-        if self.max_terminals and len(self.ptys_by_fd) >= self.max_terminals:
+        if self.max_terminals and len(self.terminals_by_fd) >= self.max_terminals:
             raise MaxTerminalsReached(self.max_terminals)
 
         term = self._new_terminal()

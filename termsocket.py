@@ -11,15 +11,12 @@ class  XtermSocketHandler(object):
         self.term_name = ws.environ['PATH_INFO']
         print(ws.environ)
         self.term_size = (None,None)
-       
-        self._logger = logging.getLogger(__name__)
-
         self.terminal = None # instant of PtyWithClients
+        self._logger = logging.getLogger(__name__)
     
     def on_open(self):
-        """ xterm Websocket connection opened.
-        Call our terminal manager to get a terminal, and connect to it as a
-        client.
+        """Websocket connection opened.
+        Call terminal manager to get a terminal, and add this client to it
         """
         self.terminal = self.term_manager.get_terminal(self.term_name)
         for s in self.terminal.read_buffer:
