@@ -1,4 +1,4 @@
-"""Terminal management for exposing terminals to a web interface using Tornado.
+"""Terminal manageme module
 """
 from __future__ import absolute_import, print_function
 
@@ -11,39 +11,54 @@ import signal
 from ptyprocess import PtyProcessUnicode
 
 import gevent
-from gevent.os import nb_read,nb_write,make_nonblocking
+from gevent.socket import wait_read
+# from gevent.os import nb_read,nb_write,make_nonblocking
+# from gevent.hub import get_hub
 
 DEFAULT_TERM_TYPE = "xterm"
 
-from gevent.socket import wait_read
-from gevent.hub import get_hub
-
 class FdWatcher(object):
-    watchers = {}
-    @classmethod
-    def add_fd(cls, fd, cb):
-        cls.watchers[fd] = gevent.spawn(FdWatcher.geen,fd,cb)
-        print ("watching fd",fd,"by",cls.watchers[fd])
-    @classmethod
+
+    def __init__(self,terminal):
+        self.callback = None
+        self.terminal = terminal
+        self.g = None
+
+    def start(self, callback):
+        self.callback = callback
+        self.g = gevent.spawn(FdWatcher.green_watch,self)
+        print ("watching fd for terminal %r" % self.terminal)
     
-    def remove_fd(cls,fd):
-        pass
+    def remove(self):
+        self.callback = None
+        self.g = None
 
     @staticmethod
-    def geen(fd,cb):
+    def green_watch(watcher):
         import random
-        id = random.randint(100,200)    
-        while True:
-            print (" [G:%s] agin wait" % id)
+        id = random.randint(1000,9000)
+        fd = watcher.terminal.ptyproc.fd
+        while watcher.callback:
+            print (" [G:%s] on wait" % id)
             wait_read(fd)
-            print ("[G:%s]something to be read"%id)
+            print (" [G:%s] after wait,something to be read"%id)
             try:
-                cb(fd)
+                watcher.callback(watcher.terminal)
             except Exception as oops:
-                print("[G:%s]something happend in cb" %id ,repr(oops))
                 if isinstance(oops,EOFError):
-                    print("Exits fd watch for fd =",fd)
+                    print(" [G:%sExits fd watch for fd =" % id,fd)
                     return
+                raise
+        print("green watcher for fd=%s ended gracefully" % fd)
+
+def _update_removing(target, changes):
+    """Like dict.update(), but remove keys where the value is None.
+    """
+    for k, v in changes.items():
+        if v is None:
+            target.pop(k, None)
+        else:
+            target[k] = v
 
 class Terminal(object):
     """Consists single pty object and tracks all assosiated web socket clients
@@ -53,7 +68,7 @@ class Terminal(object):
         ptyproc = PtyProcessUnicode.spawn(argv, env=env,cwd=cwd)
         self.ptyproc = ptyproc
         self.name = name
-
+        self.read_watch = FdWatcher(self)
         # tracker for XtermSocketHandler connected to this terminal
         self.clients = []
 
@@ -63,9 +78,23 @@ class Terminal(object):
         self.read_buffer = deque([], maxlen=15)
     
     def __repr__(self):
-        return ("<Terminal(name=%s, fd=%s, clients=[%r])>" % 
+        return ("<Terminal(name=%s, fd=%s, clients=%r)>" % 
                     (self.name, self.ptyproc.fd, self.clients))
-                    
+
+    # this method is not needed. directly calling ptyprc.write
+    # from socketHandler is good.
+    # def write(self,data):  
+    #     if not self.ptyproc.write(data):
+    #         if self.ptyproc.fd < 0:
+    #             print("broad cast death new")
+    #             [c.on_pty_died for c in self.clients]
+
+    def start_reading(self,cb):
+        self.read_watch.start(cb)
+    
+    def stop_reading(self):
+        self.read_watch.remove()
+
     def resize_to_smallest(self):
         """Set the terminal size to that of the smallest client dimensions.
         A terminal not using the full space available is much nicer than a
@@ -140,14 +169,7 @@ class Terminal(object):
             else:
                 return(False)
 
-def _update_removing(target, changes):
-    """Like dict.update(), but remove keys where the value is None.
-    """
-    for k, v in changes.items():
-        if v is None:
-            target.pop(k, None)
-        else:
-            target[k] = v
+
 
 class TermManagerBase(object):
     """Base class for a terminal manager."""
@@ -161,7 +183,7 @@ class TermManagerBase(object):
 
         self.log = logging.getLogger(__name__)
 
-        self.terminals_by_fd = {}
+        self.terminals = []
 
     def _make_term_env(self, height=25, width=80, winheight=0, winwidth=0, **kwargs):
         """Build the environment variables for the process in the terminal."""
@@ -179,55 +201,50 @@ class TermManagerBase(object):
 
         return env
 
-    def _new_terminal(self, **kwargs):
+    def _new_terminal(self, name='tty',**kwargs):
         """Make a new terminal, return a :class:`Terminal` instance."""
         options = self.term_settings.copy()
         options['shell_command'] = self.shell_command
         options.update(kwargs) 
         argv = options['shell_command']
         env = self._make_term_env(**options)
-        terminal = Terminal(argv, env=env, cwd=options.get('cwd', None))
+        terminal = Terminal(argv,env=env, cwd=options.get('cwd', None),name=name)
         self.log.info('New Termainal started %r' % terminal)
+        self.terminals.append(terminal)
         return terminal
+       
 
-    def _start_reading(self, terminal):
-        """Connect a terminal to the tornado event loop to read data from it."""
-        fd = terminal.ptyproc.fd
-        self.terminals_by_fd[fd] = terminal
-        FdWatcher.add_fd(fd, self._pty_read)
-
-    def _on_eof(self, ptywclients):
-        """Called when the pty has closed.
+    def _on_eof(self, terminal):
+        """Called when the pty of a Terminal instance has closed.
         """
         # Stop trying to read from that terminal
-        fd = ptywclients.ptyproc.fd
-        self.log.info(" ******** EOF on FD %d; stopping reading", fd)
-        del self.terminals_by_fd[fd]
-        FdWatcher.remove_fd(fd)
-
+        #self.log.info(" ******** EOF on FD %d; stopping reading", fd)
+        self.terminals.remove(terminal)
+        terminal.stop_reading()
+        
         # This closes the fd, and should result in the process being reaped.
-        ptywclients.ptyproc.close()
+        terminal.ptyproc.close()
 
-    def _pty_read(self, fd):
-        """Called by the event loop when there is pty data ready to read."""
-        ptywclients = self.terminals_by_fd[fd]
+    def _pty_read_callback(self, terminal):
+        """Called by the Terminal FdWatcher greenlet when
+        there is pty data ready to be read."""
         try:
-            s = ptywclients.ptyproc.read(65536)
+            s = terminal.ptyproc.read(65536)
             print("read %s bytes" % len(s))
-            ptywclients.read_buffer.append(s)
-            for client in ptywclients.clients:
+            terminal.read_buffer.append(s)
+            for client in terminal.clients:
                 client.on_pty_read(s)
         except EOFError:
-            self._on_eof(ptywclients)
-            for client in ptywclients.clients:
+            self._on_eof(terminal)
+            for client in terminal.clients:
                 client.on_pty_died()
-            raise
+            # raise so that FDwatchet eventloop will close : TODO remove
+            # raise
 
     def get_terminal(self, *args, **kwargs):
-        """Override in a subclass to give a terminal to a new websocket connection
-        The :class:`TermSocket` handler works with zero or one URL components
-        (capturing groups in the URL spec regex). If it receives one, it is
-        passed as the ``url_component`` parameter; otherwise, this is None.
+        """Should be implemented in a subclass.
+        Provides a terminal instance (object of :class:Terminal) 
+        to a new websocket connection
         """
         raise NotImplementedError
 
@@ -254,85 +271,20 @@ class SingleTermManager(TermManagerBase):
     """All connections to the websocket share a common terminal."""
     def __init__(self, **kwargs):
         super(SingleTermManager, self).__init__(**kwargs)
-        self.terminal = None
 
-    def get_terminal(self, term_name=None):
-        if self.terminal is None:
+    def get_terminal(self,term_name=None):
+        if not self.terminals:
             #ie, first websocket connection
-            self.terminal = self._new_terminal()
-            self._start_reading(self.terminal)
-        return self.terminal
+            term = self._new_terminal()
+            term.start_reading(self._pty_read_callback)
+            return term
+        assert len(self.terminals) == 1
+        return self.terminals[0]
     
     # @gen.coroutine
     # def kill_all(self):
     #     yield super(SingleTermManager, self).kill_all()
     #     self.terminal = None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class MaxTerminalsReached(Exception):
@@ -349,11 +301,11 @@ class UniqueTermManager(TermManagerBase):
         self.max_terminals = max_terminals
 
     def get_terminal(self, term_name=None):
-        if self.max_terminals and len(self.terminals_by_fd) >= self.max_terminals:
+        if self.max_terminals and len(self.terminals) >= self.max_terminals:
             raise MaxTerminalsReached(self.max_terminals)
 
         term = self._new_terminal()
-        self._start_reading(term)
+        term.start_reading(self._pty_read_callback)
         return term
 
     def client_disconnected(self, websocket):
@@ -366,59 +318,54 @@ class UniqueTermManager(TermManagerBase):
 class NamedTermManager(TermManagerBase):
     """Share terminals between websockets connected to the same endpoint.
     """
+    
+    name_template = "%d"
+
     def __init__(self, max_terminals=None, **kwargs):
         super(NamedTermManager, self).__init__(**kwargs)
         self.max_terminals = max_terminals
-        self.terminals = {}
 
     def get_terminal(self, term_name):
         assert term_name is not None
-        
-        if term_name in self.terminals:
-            return self.terminals[term_name]
+        self.log.info("Gets terminal by specified name: %s", term_name)
+        term = next((t for t in self.terminals if t.name == term_name),None)
+        if term:
+            return term
         
         if self.max_terminals and len(self.terminals) >= self.max_terminals:
             raise MaxTerminalsReached(self.max_terminals)
 
         # Create new terminal
-        self.log.info("New terminal with specified name: %s", term_name)
-        term = self._new_terminal()
-        term.term_name = term_name
-        self.terminals[term_name] = term
-        self._start_reading(term)
+        
+        term = self._new_terminal(name=term_name)
+        term.start_reading(self._pty_read_callback)
         return term
 
-    name_template = "%d"
-
     def _next_available_name(self):
+        taken_names = [t.name  for t in self.terminals]
         for n in itertools.count(start=1):
             name = self.name_template % n
-            if name not in self.terminals:
+            if name not in taken_names:
                 return name
 
     def new_named_terminal(self):
         name = self._next_available_name()
-        term = self._new_terminal()
+        term = self._new_terminal(name=name)
         self.log.info("New terminal with automatic name: %s", name)
-        term.term_name = name
-        self.terminals[name] = term
-        self._start_reading(term)
+        term.start_reading(self._pty_read_callback)
         return name, term
 
-    def kill(self, name, sig=signal.SIGTERM):
-        term = self.terminals[name]
-        term.kill()   # This should lead to an EOF
+    def kill_by_name(self, name, sig=signal.SIGTERM):
+        term = next((t for t in self.terminals if t.name == name),None)
+        print("killing",name,"from list",[t.name for t in self.terminals])
+        if term:
+            term.kill()   # This should lead to an EOF
+            return term
     
     # @gen.coroutine
     # def terminate(self, name, force=False):
     #     term = self.terminals[name]
     #     yield term.terminate(force=force)
-    
-    def on_eof(self, ptywclients):
-        super(NamedTermManager, self)._on_eof(ptywclients)
-        name = ptywclients.term_name
-        self.log.info("Terminal %s closed", name)
-        self.terminals.pop(name, None)
     
     # @gen.coroutine
     # def kill_all(self):
